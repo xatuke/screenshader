@@ -1,0 +1,15 @@
+# Compiled binaries
+screenshader
+screenshader-preview
+
+# Python
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
+
+# Editor
+*.swp
+*.swo
+*~
