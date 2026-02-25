@@ -30,7 +30,8 @@ make x11      # Linux/X11 only
 
 ```
 ./screenshader.sh                        # start with default CRT shader
-./screenshader.sh shaders/amber.frag     # pick a shader
+./screenshader.sh amber                  # pick a shader by name
+./screenshader.sh shaders/amber.frag     # or by file path
 ./screenshader.sh --list                 # list available shaders
 ./screenshader.sh --stop                 # stop the overlay
 ./screenshader.sh --reload               # hot-reload current shader

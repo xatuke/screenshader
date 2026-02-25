@@ -399,7 +399,8 @@ case "${1:-}" in
         echo ""
         echo "Options:"
         echo "  (no args)       Start with CRT shader"
-        echo "  shader.frag     Start with specified shader"
+        echo "  NAME            Start with a built-in shader by name (e.g. crt, amber)"
+        echo "  shader.frag     Start with a shader file path"
         echo "  --stop, -s      Stop the running compositor"
         echo "  --reload, -r    Hot-reload the current shader"
         echo "  --list, -l      List available shaders"
@@ -419,12 +420,24 @@ case "${1:-}" in
         echo ""
         echo "Examples:"
         echo "  $(basename "$0")                           # CRT effect"
-        echo "  $(basename "$0") shaders/amber.frag        # Amber terminal"
+        echo "  $(basename "$0") amber                     # Amber terminal (by name)"
+        echo "  $(basename "$0") shaders/amber.frag        # Amber terminal (by path)"
         echo "  $(basename "$0") --set u_curvature 0.15    # Crank up curvature"
         echo "  $(basename "$0") --set u_curvature 0       # Flat (no curve)"
         echo "  $(basename "$0") --stop                    # Restore normal desktop"
         ;;
     *)
-        do_start "$1"
+        shader="$1"
+        if [ -n "$shader" ] && [ ! -f "$shader" ]; then
+            # Try resolving as a bare shader name (e.g. "crt" → "shaders/crt.frag")
+            if [ -f "$SCRIPT_DIR/shaders/${shader}.frag" ]; then
+                shader="$SCRIPT_DIR/shaders/${shader}.frag"
+            else
+                echo "Error: shader not found: $shader"
+                echo "Run '$(basename "$0") --list' to see available shaders."
+                exit 1
+            fi
+        fi
+        do_start "$shader"
         ;;
 esac
