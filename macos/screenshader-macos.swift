@@ -724,7 +724,7 @@ class OverlayWindow: NSWindow {
         self.backgroundColor = .clear
         self.ignoresMouseEvents = true
         self.hasShadow = false
-        self.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+        self.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
 
         // Keep window on top and spanning the full screen
         self.setFrame(screen.frame, display: true)
@@ -796,7 +796,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Handle SIGUSR1 for reload
         setupSignalHandlers()
 
+        // Hide overlay during workspace transitions to avoid lag
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self,
+            selector: #selector(spaceWillChange),
+            name: NSWorkspace.activeSpaceDidChangeNotification,
+            object: nil
+        )
+
         fputs("screenshader-macos: overlay active with \(shaderPath)\n", stderr)
+    }
+
+    @objc func spaceWillChange() {
+        // Transition just completed — briefly hide to clear stale transition frames
+        overlayWindow?.alphaValue = 0
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+            self?.overlayWindow?.alphaValue = 1
+        }
     }
 
     func startCapture() {

@@ -12,7 +12,7 @@ Real-time screen shader overlay for your desktop. Applies GLSL post-processing e
 
 20 built-in effects in `shaders/`:
 
-`crt` `amber` `green` `glitch` `vhs` `thermal` `matrix` `sketch` `dreamy` `oilpaint` `underwater` `anime` `nightlight` `neon` `halftone` `filmgrain` `pixelate` `marvel` `lcd` `tilt_shift`
+`crt` `amber` `green` `glitch` `vhs` `thermal` `matrix` `sketch` `dreamy` `oilpaint` `underwater` `anime` `nightlight` `neon` `halftone` `filmgrain` `pixelate` `marvel` `lcd` `tilt_shift` `rain` `minecraft`
 
 ## Build
 
