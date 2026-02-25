@@ -744,6 +744,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // File watcher for hot-reload
     var fileWatcherSource: DispatchSourceFileSystemObject?
 
+    // Signal handler sources (must be retained)
+    var sigintSource: DispatchSourceSignal?
+    var sigtermSource: DispatchSourceSignal?
+    var sigusr1Source: DispatchSourceSignal?
+
     init(shaderPath: String) {
         self.shaderPath = shaderPath
         super.init()
@@ -878,28 +883,28 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func setupSignalHandlers() {
         // SIGUSR1 = reload shader
-        let usr1Source = DispatchSource.makeSignalSource(signal: SIGUSR1, queue: .main)
-        usr1Source.setEventHandler { [weak self] in
+        signal(SIGUSR1, SIG_IGN)
+        sigusr1Source = DispatchSource.makeSignalSource(signal: SIGUSR1, queue: .main)
+        sigusr1Source?.setEventHandler { [weak self] in
             fputs("Received SIGUSR1, reloading shader...\n", stderr)
             self?.renderer?.loadShader()
         }
-        usr1Source.resume()
-        signal(SIGUSR1, SIG_IGN) // Ignore default handler, use dispatch source
+        sigusr1Source?.resume()
 
         // SIGTERM/SIGINT = clean exit
-        let termSource = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
-        termSource.setEventHandler {
-            NSApp.terminate(nil)
-        }
-        termSource.resume()
         signal(SIGTERM, SIG_IGN)
-
-        let intSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
-        intSource.setEventHandler {
+        sigtermSource = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
+        sigtermSource?.setEventHandler {
             NSApp.terminate(nil)
         }
-        intSource.resume()
+        sigtermSource?.resume()
+
         signal(SIGINT, SIG_IGN)
+        sigintSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
+        sigintSource?.setEventHandler {
+            NSApp.terminate(nil)
+        }
+        sigintSource?.resume()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
