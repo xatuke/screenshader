@@ -74,8 +74,23 @@ func convertGLSLtoMSL(_ glsl: String) -> String {
     // We handle this in the main() extraction
 
     // const float → constant float (top-level only — inside functions, const is fine in Metal)
-    // Actually, Metal accepts 'const' inside functions. Only file-scope needs 'constant'.
-    // We'll handle this by converting top-level const declarations.
+    // Convert top-level const declarations before extractMainBody splits things.
+    do {
+        var convertedLines: [String] = []
+        var braceDepth = 0
+        for line in body.components(separatedBy: "\n") {
+            var outLine = line
+            if braceDepth == 0 {
+                let t = line.trimmingCharacters(in: .whitespaces)
+                if t.hasPrefix("const ") {
+                    outLine = line.replacingOccurrences(of: "const ", with: "constant ")
+                }
+            }
+            braceDepth += line.filter({ $0 == "{" }).count - line.filter({ $0 == "}" }).count
+            convertedLines.append(outLine)
+        }
+        body = convertedLines.joined(separator: "\n")
+    }
 
     // Build the MSL output
     var msl = """
@@ -118,10 +133,10 @@ func convertGLSLtoMSL(_ glsl: String) -> String {
     let (helpers, mainBody) = extractMainBody(body)
 
     // Add helper functions — rewrite their signatures for Metal
-    // Helper functions that reference u_screen need the texture+sampler passed in.
-    // For simplicity, we convert helpers that reference u_screen to take texture+sampler params.
-    let convertedHelpers = convertHelperFunctions(helpers, hasTexture: body.contains("u_screen"))
-    msl += convertedHelpers
+    // Helper functions that reference globals (u_screen, u_resolution, u_time)
+    // get those added as parameters since they're locals in Metal.
+    let helperResult = convertHelperFunctions(helpers)
+    msl += helperResult.code
 
     // Build the fragment function
     msl += """
@@ -143,7 +158,11 @@ func convertGLSLtoMSL(_ glsl: String) -> String {
     }
 
     // Convert the main body: replace frag_color assignments with returns
+    // Also fix call sites of helper functions that got extra params
     var convertedMain = mainBody
+    for fixup in helperResult.fixups {
+        convertedMain = addExtraArgsToCallSites(convertedMain, funcName: fixup.name, extraArgs: fixup.extraArgs)
+    }
     // Handle early returns: frag_color = vec4(...); return; → return float4(...);
     convertedMain = convertedMain.replacingOccurrences(
         of: "frag_color",
@@ -255,29 +274,34 @@ func extractMainBody(_ code: String) -> (helpers: String, mainBody: String) {
     return (helpers, mainBody)
 }
 
-/// Convert helper functions — add texture/sampler parameters to functions that sample textures
-func convertHelperFunctions(_ helpers: String, hasTexture: Bool) -> String {
-    guard hasTexture else { return helpers }
-
-    var result = helpers
-
-    // Find functions that reference u_screen and add texture+sampler params
-    // Pattern: detect function definitions that contain u_screen in their body
-    let lines = result.components(separatedBy: "\n")
+/// Convert helper functions — add extra parameters for globals they reference
+/// (texture/sampler for u_screen, and u_resolution/u_time as needed)
+func convertHelperFunctions(_ helpers: String) -> (code: String, fixups: [(name: String, extraArgs: [String])]) {
+    let lines = helpers.components(separatedBy: "\n")
     var output: [String] = []
     var inFunction = false
     var funcLines: [String] = []
+    var funcName = ""
     var funcUsesTexture = false
+    var funcUsesResolution = false
+    var funcUsesTime = false
     var braceDepth = 0
+
+    // Track which functions need extra params so we can fix call sites
+    var funcsNeedingTexture: Set<String> = []
+    var funcsNeedingResolution: Set<String> = []
+    var funcsNeedingTime: Set<String> = []
 
     for line in lines {
         if !inFunction {
-            // Check if this line starts a function definition (type name(...) {)
             let trimmed = line.trimmingCharacters(in: .whitespaces)
             if isFunctionDefinition(trimmed) && !trimmed.hasPrefix("void main") {
                 inFunction = true
                 funcLines = [line]
+                funcName = extractFuncName(trimmed)
                 funcUsesTexture = line.contains("u_screen") || line.contains(".sample(samp,")
+                funcUsesResolution = line.contains("u_resolution")
+                funcUsesTime = line.contains("u_time")
                 braceDepth = countBraces(line)
                 if braceDepth == 0 && trimmed.hasSuffix("{") {
                     braceDepth = 1
@@ -287,15 +311,28 @@ func convertHelperFunctions(_ helpers: String, hasTexture: Bool) -> String {
             output.append(line)
         } else {
             funcLines.append(line)
-            if line.contains("u_screen") || line.contains(".sample(samp,") {
-                funcUsesTexture = true
-            }
+            if line.contains("u_screen") || line.contains(".sample(samp,") { funcUsesTexture = true }
+            if line.contains("u_resolution") { funcUsesResolution = true }
+            if line.contains("u_time") { funcUsesTime = true }
             braceDepth += countBraces(line)
             if braceDepth <= 0 {
-                // Function ended
-                if funcUsesTexture {
-                    // Add texture2d and sampler params to the function signature
-                    funcLines = addTextureParams(funcLines)
+                // Function ended — add extra params as needed
+                if funcUsesTexture || funcUsesResolution || funcUsesTime {
+                    var extraParams: [String] = []
+                    if funcUsesTexture {
+                        extraParams.append("texture2d<float> u_screen")
+                        extraParams.append("sampler samp")
+                        funcsNeedingTexture.insert(funcName)
+                    }
+                    if funcUsesResolution {
+                        extraParams.append("float2 u_resolution")
+                        funcsNeedingResolution.insert(funcName)
+                    }
+                    if funcUsesTime {
+                        extraParams.append("float u_time")
+                        funcsNeedingTime.insert(funcName)
+                    }
+                    funcLines = addExtraParams(funcLines, extraParams)
                 }
                 output.append(contentsOf: funcLines)
                 inFunction = false
@@ -304,20 +341,125 @@ func convertHelperFunctions(_ helpers: String, hasTexture: Bool) -> String {
         }
     }
 
-    // Append any remaining lines
     if !funcLines.isEmpty {
         output.append(contentsOf: funcLines)
     }
 
-    result = output.joined(separator: "\n")
+    var result = output.joined(separator: "\n")
 
-    // Now fix call sites of functions that got texture params added
-    // This is tricky in general. For our shaders, the pattern is simple:
-    // functions like textDetect(uv, px) that sample u_screen need u_screen+samp added.
-    // We handle this by finding calls to these functions and adding the params.
-    // For now, this is sufficient for our shader set.
+    // Build fixups list for fixing call sites (both in helpers and in mainBody)
+    var fixups: [(name: String, extraArgs: [String])] = []
+    for name in funcsNeedingTexture.union(funcsNeedingResolution).union(funcsNeedingTime) {
+        var extraArgs: [String] = []
+        if funcsNeedingTexture.contains(name) {
+            extraArgs.append("u_screen")
+            extraArgs.append("samp")
+        }
+        if funcsNeedingResolution.contains(name) { extraArgs.append("u_resolution") }
+        if funcsNeedingTime.contains(name) { extraArgs.append("u_time") }
+        result = addExtraArgsToCallSites(result, funcName: name, extraArgs: extraArgs)
+        fixups.append((name: name, extraArgs: extraArgs))
+    }
 
+    return (code: result, fixups: fixups)
+}
+
+/// Extract function name from a function definition line
+func extractFuncName(_ line: String) -> String {
+    // Pattern: "type name(..."
+    let types = ["float", "float2", "float3", "float4", "int", "void",
+                 "float2x2", "float3x3", "float4x4", "half", "half2", "half3", "half4"]
+    for t in types {
+        if line.hasPrefix(t + " ") {
+            let rest = line.dropFirst(t.count + 1).trimmingCharacters(in: .whitespaces)
+            if let parenIdx = rest.firstIndex(of: "(") {
+                return String(rest[rest.startIndex..<parenIdx]).trimmingCharacters(in: .whitespaces)
+            }
+        }
+    }
+    return ""
+}
+
+/// Add extra params to a function's signature
+func addExtraParams(_ funcLines: [String], _ extraParams: [String]) -> [String] {
+    guard var firstLine = funcLines.first else { return funcLines }
+    if let parenIdx = firstLine.lastIndex(of: ")") {
+        let before = String(firstLine[firstLine.startIndex..<parenIdx])
+        let after = String(firstLine[parenIdx...])
+        if before.contains("(") {
+            let openParen = before.lastIndex(of: "(")!
+            let params = String(before[before.index(after: openParen)...]).trimmingCharacters(in: .whitespaces)
+            let extra = extraParams.joined(separator: ", ")
+            if params.isEmpty {
+                firstLine = before + extra + after
+            } else {
+                firstLine = before + ", " + extra + after
+            }
+        }
+    }
+    var result = [firstLine]
+    result.append(contentsOf: funcLines.dropFirst())
     return result
+}
+
+/// Add extra arguments to all call sites of a function
+func addExtraArgsToCallSites(_ code: String, funcName: String, extraArgs: [String]) -> String {
+    let pattern = funcName + "("
+    var result = ""
+    var i = code.startIndex
+
+    while i < code.endIndex {
+        if code[i...].hasPrefix(pattern) {
+            // Skip function definitions — detected by a return type keyword before the name
+            var isDefinition = false
+            if i > code.startIndex {
+                // Walk backwards past whitespace to find the preceding word
+                var back = code.index(before: i)
+                while back > code.startIndex && code[back] == " " {
+                    back = code.index(before: back)
+                }
+                // Check if the preceding word is a type keyword
+                let defTypes = ["float", "float2", "float3", "float4", "int", "void",
+                                "float2x2", "float3x3", "float4x4", "half", "half2", "half3", "half4"]
+                let preceding = String(code[code.startIndex...back])
+                for t in defTypes {
+                    if preceding.hasSuffix(t) { isDefinition = true; break }
+                }
+            }
+            if !isDefinition {
+                let argsStart = code.index(i, offsetBy: pattern.count)
+                if let closeIdx = findMatchingParen(code, from: argsStart) {
+                    let existingArgs = String(code[argsStart..<closeIdx]).trimmingCharacters(in: .whitespaces)
+                    let extra = extraArgs.joined(separator: ", ")
+                    if existingArgs.isEmpty {
+                        result += funcName + "(" + extra + ")"
+                    } else {
+                        result += funcName + "(" + existingArgs + ", " + extra + ")"
+                    }
+                    i = code.index(after: closeIdx)
+                    continue
+                }
+            }
+        }
+        result.append(code[i])
+        i = code.index(after: i)
+    }
+    return result
+}
+
+/// Find the index of the matching closing parenthesis
+func findMatchingParen(_ code: String, from start: String.Index) -> String.Index? {
+    var depth = 0
+    var idx = start
+    while idx < code.endIndex {
+        if code[idx] == "(" { depth += 1 }
+        else if code[idx] == ")" {
+            if depth == 0 { return idx }
+            depth -= 1
+        }
+        idx = code.index(after: idx)
+    }
+    return nil
 }
 
 func isFunctionDefinition(_ line: String) -> Bool {
@@ -351,30 +493,6 @@ func countBraces(_ line: String) -> Int {
     return count
 }
 
-func addTextureParams(_ funcLines: [String]) -> [String] {
-    guard var firstLine = funcLines.first else { return funcLines }
-
-    // Insert texture2d<float> u_screen, sampler samp before the closing paren of params
-    if let parenIdx = firstLine.lastIndex(of: ")") {
-        let before = String(firstLine[firstLine.startIndex..<parenIdx])
-        let after = String(firstLine[parenIdx...])
-        // Check if there are existing params
-        if before.contains("(") {
-            let openParen = before.lastIndex(of: "(")!
-            let params = String(before[before.index(after: openParen)...])
-                .trimmingCharacters(in: .whitespaces)
-            if params.isEmpty {
-                firstLine = before + "texture2d<float> u_screen, sampler samp" + after
-            } else {
-                firstLine = before + ", texture2d<float> u_screen, sampler samp" + after
-            }
-        }
-    }
-
-    var result = [firstLine]
-    result.append(contentsOf: funcLines.dropFirst())
-    return result
-}
 
 /// Fix early returns inside the fragment function: `return;` → `return _frag_out;`
 func fixEarlyReturns(_ msl: String) -> String {
@@ -598,8 +716,7 @@ class OverlayWindow: NSWindow {
             contentRect: screen.frame,
             styleMask: .borderless,
             backing: .buffered,
-            defer: false,
-            screen: screen
+            defer: false
         )
 
         self.level = .screenSaver
